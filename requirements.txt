@@ -4,3 +4,4 @@ sqlalchemy
 qrcode[pil]
 pydantic
 python-multipart
+opencv-python-headless
