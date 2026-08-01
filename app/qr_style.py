@@ -5,13 +5,15 @@ import numpy as np
 import qrcode
 from qrcode.constants import ERROR_CORRECT_H
 from qrcode.util import pattern_position
-from PIL import Image, ImageOps, ImageStat
+from PIL import Image, ImageFilter, ImageOps
 
 DEFAULT_ACCENT = "#1a1a1a"
 DEFAULT_BACKGROUND = "#ffffff"
 FINDER_ZONE = 8  # finder pattern (7x7) plus its 1-module separator ring
-MIN_VERSION = 6  # ~41x41 modules minimum: enough resolution to read as a photo,
-# small enough that modules stay easy for a scanner to resolve
+MIN_VERSION = 14  # ~73x73 modules minimum: at low module counts, each module's
+# forced color is a large, individually-obvious block; at this resolution the
+# same forcing reads as fine grain instead of blotches, which is what actually
+# keeps a real (detailed, busy-background) photo recognizable.
 
 # Escalating (low_force, high_force) pairs. low_force controls how much a module
 # that already agrees with the photo gets nudged toward pure black/white;
@@ -19,12 +21,14 @@ MIN_VERSION = 6  # ~41x41 modules minimum: enough resolution to read as a photo,
 # at the most photo-preserving level first and only fall back to stronger
 # (uglier but safer) levels if the result doesn't actually decode.
 FORCE_LADDER = [
+    (0.05, 0.45),
+    (0.10, 0.60),
+    (0.15, 0.75),
     (0.15, 0.85),
-    (0.25, 0.88),
-    (0.35, 0.90),
-    (0.50, 0.95),
-    (0.70, 1.0),
-    (0.90, 1.0),
+    (0.25, 0.90),
+    (0.35, 0.95),
+    (0.50, 1.0),
+    (0.75, 1.0),
     (1.0, 1.0),  # failsafe: zero photo influence, functionally a plain QR
 ]
 
@@ -32,7 +36,7 @@ FORCE_LADDER = [
 # out to be unreliable for certain scanners regardless of styling (observed:
 # version 6 at ERROR_CORRECT_H). Bumping the version sidesteps that, so it's
 # tried as an outer fallback layer alongside the force ladder.
-VERSION_ESCALATION_OFFSETS = [0, 1, 2, 3, 5]
+VERSION_ESCALATION_OFFSETS = [0, 2, 4, 6, 10]
 
 
 def _hex_to_rgb(value: Optional[str], fallback: Tuple[int, int, int]) -> Tuple[int, int, int]:
@@ -43,10 +47,6 @@ def _hex_to_rgb(value: Optional[str], fallback: Tuple[int, int, int]) -> Tuple[i
         return tuple(int(value[i : i + 2], 16) for i in (0, 2, 4))
     except ValueError:
         return fallback
-
-
-def _lerp(a: Tuple[int, int, int], b: Tuple[int, int, int], t: float) -> Tuple[int, int, int]:
-    return tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
 
 def _median_luminance(gray_img: Image.Image) -> float:
@@ -73,40 +73,32 @@ def _alignment_centers(version: int, n: int):
     return centers
 
 
-def _in_version_info_zone(row: int, col: int, n: int, version: int) -> bool:
-    """Versions 7+ carry two redundant version-info blocks near the top-right
-    and bottom-left finder patterns, just outside the finder+separator zone.
-    They're only BCH-protected for up to 3 bit errors, so they can't take the
-    same photo-blend treatment as ordinary data modules."""
-    if version < 7:
-        return False
-    lo, hi = n - 11, n - 9
-    if row <= 5 and lo <= col <= hi:
-        return True
-    if col <= 5 and lo <= row <= hi:
-        return True
-    return False
-
-
-def _in_crisp_zone(row: int, col: int, n: int, version: int, alignment_centers) -> bool:
+def _crisp_mask(n: int, version: int, alignment_centers) -> np.ndarray:
     """Finder, timing, alignment, and version-info patterns must stay
     undistorted — these are the structural landmarks (and metadata) a
     scanner needs to locate and correctly sample the grid, and they aren't
     protected by error correction the way ordinary data modules are."""
-    if row < FINDER_ZONE and col < FINDER_ZONE:
-        return True
-    if row < FINDER_ZONE and col >= n - FINDER_ZONE:
-        return True
-    if row >= n - FINDER_ZONE and col < FINDER_ZONE:
-        return True
-    if row == 6 or col == 6:
-        return True
-    if _in_version_info_zone(row, col, n, version):
-        return True
+    mask = np.zeros((n, n), dtype=bool)
+    mask[:FINDER_ZONE, :FINDER_ZONE] = True
+    mask[:FINDER_ZONE, n - FINDER_ZONE :] = True
+    mask[n - FINDER_ZONE :, :FINDER_ZONE] = True
+    mask[6, :] = True
+    mask[:, 6] = True
+
+    if version >= 7:
+        # Two redundant version-info blocks near the top-right and bottom-left
+        # finder patterns, just outside the finder+separator zone. They're
+        # only BCH-protected for up to 3 bit errors.
+        lo, hi = n - 11, n - 9
+        mask[:6, lo : hi + 1] = True
+        mask[lo : hi + 1, :6] = True
+
     for r, c in alignment_centers:
-        if abs(row - r) <= 2 and abs(col - c) <= 2:
-            return True
-    return False
+        r0, r1 = max(0, r - 2), min(n, r + 3)
+        c0, c1 = max(0, c - 2), min(n, c + 3)
+        mask[r0:r1, c0:c1] = True
+
+    return mask
 
 
 def _build_qr_matrix(data: str, box_size: int, border: int, min_version: int):
@@ -122,75 +114,89 @@ def _build_qr_matrix(data: str, box_size: int, border: int, min_version: int):
     return qr
 
 
-def _render_photo_qr(
-    qr,
-    photo: Image.Image,
-    accent: Tuple[int, int, int],
-    background: Tuple[int, int, int],
-    box_size: int,
-    border: int,
-    low_force: float,
-    high_force: float,
-) -> Image.Image:
-    modules = qr.modules
+def _prepare_photo_render(qr, photo: Image.Image, accent, background, box_size: int, border: int) -> dict:
+    """Do the expensive, force-independent work once per (qr version, photo,
+    color) combination: blur/resize the photo down to module resolution and
+    precompute per-module statistics. The force ladder then just re-blends
+    these precomputed arrays, which is cheap enough to try every rung."""
     n = qr.modules_count
     alignment_centers = _alignment_centers(qr.version, n)
-
     data_size = n * box_size
     full_size = data_size + 2 * border * box_size
+    offset = border * box_size
 
-    grayscale = ImageOps.autocontrast(photo.convert("L"))
+    grayscale = photo.convert("L")
+    # A real photo carries far more fine detail (skin texture, background
+    # clutter, fabric patterns) than a ~70x70-module grid can represent.
+    # Without smoothing it first, that detail doesn't shrink gracefully — it
+    # aliases into per-module noise that looks nothing like the source. Blur
+    # radius is sized against module count (n), not final canvas pixels,
+    # since the effective information resolution is one value per module.
+    downsample_ratio = min(grayscale.size) / n
+    blur_radius = max(2.0, downsample_ratio * 0.6)
+    grayscale = grayscale.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    grayscale = ImageOps.autocontrast(grayscale, cutoff=1)
     fitted = ImageOps.fit(grayscale, (data_size, data_size), Image.LANCZOS)
     duotone = ImageOps.colorize(fitted, black=accent, white=background).convert("RGB")
 
+    fitted_arr = np.asarray(fitted, dtype=np.float64)
+    duotone_arr = np.asarray(duotone, dtype=np.float64)
+
+    local_lum_grid = fitted_arr.reshape(n, box_size, n, box_size).mean(axis=(1, 3))
+    avg_color_grid = duotone_arr.reshape(n, box_size, n, box_size, 3).mean(axis=(1, 3))
+
+    modules_arr = np.array(qr.modules, dtype=bool)
+    crisp_mask = _crisp_mask(n, qr.version, alignment_centers)
+
     threshold = _median_luminance(fitted)
-    light_side_range = max(255 - threshold, 1.0)
+    light_side_range = max(255.0 - threshold, 1.0)
     dark_side_range = max(threshold, 1.0)
 
-    canvas = Image.new("RGB", (full_size, full_size), background)
-    offset = border * box_size
-    canvas.paste(duotone, (offset, offset))
+    accent_arr = np.array(accent, dtype=np.float64)
+    background_arr = np.array(background, dtype=np.float64)
+    target_grid = np.where(modules_arr[..., None], accent_arr, background_arr)
 
-    for row in range(n):
-        for col in range(n):
-            dark = modules[row][col]
-            x0 = offset + col * box_size
-            y0 = offset + row * box_size
+    # How much does each module conflict with what it needs to be? 0 = the
+    # photo already agrees with the required polarity, 1 = fully opposed.
+    # Each direction is normalized by its own actual tonal range around the
+    # threshold, so a narrow-range (e.g. mostly-dark) photo still produces
+    # full-strength conflict signal instead of being swamped by the other side.
+    conflict = np.where(
+        modules_arr,
+        np.clip((local_lum_grid - threshold) / light_side_range, 0.0, 1.0),
+        np.clip((threshold - local_lum_grid) / dark_side_range, 0.0, 1.0),
+    )
 
-            if _in_crisp_zone(row, col, n, qr.version, alignment_centers):
-                color = accent if dark else background
-            else:
-                gray_region = fitted.crop(
-                    (col * box_size, row * box_size, (col + 1) * box_size, (row + 1) * box_size)
-                )
-                local_lum = ImageStat.Stat(gray_region).mean[0]
+    return {
+        "box_size": box_size,
+        "data_size": data_size,
+        "full_size": full_size,
+        "offset": offset,
+        "avg_color_grid": avg_color_grid,
+        "target_grid": target_grid,
+        "conflict": conflict,
+        "crisp_mask": crisp_mask,
+        "background": background_arr,
+    }
 
-                # How much does this pixel conflict with what its module needs to be?
-                # 0 = pixel already agrees with the required polarity, 1 = fully opposed.
-                # Each direction is normalized by its own actual tonal range around the
-                # threshold, so a narrow-range (e.g. mostly-dark) photo still produces
-                # full-strength conflict signal instead of being swamped by the other side.
-                if dark:
-                    conflict = max(0.0, (local_lum - threshold) / light_side_range)
-                else:
-                    conflict = max(0.0, (threshold - local_lum) / dark_side_range)
-                conflict = min(conflict, 1.0)
 
-                force = low_force + (high_force - low_force) * conflict
-                target = accent if dark else background
+def _apply_force(prepared: dict, low_force: float, high_force: float) -> Image.Image:
+    force = low_force + (high_force - low_force) * prepared["conflict"]
+    color_grid = prepared["avg_color_grid"] + (prepared["target_grid"] - prepared["avg_color_grid"]) * force[..., None]
+    color_grid = np.where(prepared["crisp_mask"][..., None], prepared["target_grid"], color_grid)
+    color_grid = np.clip(color_grid, 0, 255)
 
-                color_region = duotone.crop(
-                    (col * box_size, row * box_size, (col + 1) * box_size, (row + 1) * box_size)
-                )
-                avg = tuple(round(v) for v in ImageStat.Stat(color_region).mean)
-                color = _lerp(avg, target, force)
+    box_size = prepared["box_size"]
+    upscaled = np.repeat(np.repeat(color_grid, box_size, axis=0), box_size, axis=1)
 
-            canvas.paste(
-                Image.new("RGB", (box_size, box_size), color),
-                (x0, y0, x0 + box_size, y0 + box_size),
-            )
+    full_size = prepared["full_size"]
+    offset = prepared["offset"]
+    data_size = prepared["data_size"]
+    canvas = np.empty((full_size, full_size, 3), dtype=np.float64)
+    canvas[:, :] = prepared["background"]
+    canvas[offset : offset + data_size, offset : offset + data_size] = upscaled
 
-    return canvas
+    return Image.fromarray(canvas.astype(np.uint8), "RGB")
 
 
 _QR_DETECTOR = cv2.QRCodeDetector()
@@ -249,8 +255,9 @@ def build_qr_image(
                 return candidate
             continue
 
+        prepared = _prepare_photo_render(qr, photo, accent, background, box_size, border)
         for low_force, high_force in FORCE_LADDER:
-            candidate = _render_photo_qr(qr, photo, accent, background, box_size, border, low_force, high_force)
+            candidate = _apply_force(prepared, low_force, high_force)
             best = candidate
             if _decodes_to(candidate, data):
                 return candidate
