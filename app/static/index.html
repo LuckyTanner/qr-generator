@@ -26,7 +26,7 @@
     margin-bottom: 1.5rem;
   }
   h2 { font-size: 1.05rem; margin-top: 0; }
-  form { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  form { display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center; }
   input[type=url], input[type=text] {
     flex: 1;
     min-width: 220px;
@@ -35,16 +35,34 @@
     border-radius: 6px;
     font-size: 0.95rem;
   }
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+  .field input[type=color] {
+    width: 44px;
+    height: 32px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: none;
+  }
+  .field input[type=file] { font-size: 0.85rem; max-width: 220px; }
   button {
     background: var(--accent);
     color: white;
     border: none;
     border-radius: 6px;
-    padding: 0.5rem 0.9rem;
+    padding: 0.55rem 0.9rem;
     font-size: 0.95rem;
     cursor: pointer;
+    align-self: flex-end;
   }
   button:hover { opacity: 0.9; }
+  button:disabled { opacity: 0.6; cursor: default; }
   button.secondary {
     background: transparent;
     color: var(--accent);
@@ -52,13 +70,14 @@
   }
   #result { margin-top: 1rem; display: none; gap: 1rem; align-items: flex-start; }
   #result.show { display: flex; }
-  #result img { width: 150px; height: 150px; border: 1px solid var(--border); border-radius: 6px; }
+  #result img { width: 160px; height: 160px; border: 1px solid var(--border); border-radius: 6px; object-fit: contain; background: white; }
   #result .links { flex: 1; }
-  .link-row { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.4rem; }
-  .link-row code { background: rgba(127,127,127,0.15); padding: 0.15rem 0.4rem; border-radius: 4px; }
+  .link-row { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.4rem; flex-wrap: wrap; }
+  .link-row code { background: rgba(127,127,127,0.15); padding: 0.15rem 0.4rem; border-radius: 4px; word-break: break-all; }
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: 0.5rem 0.4rem; border-bottom: 1px solid var(--border); font-size: 0.9rem; vertical-align: middle; }
   th { color: var(--muted); font-weight: 600; }
+  td.thumb img { width: 44px; height: 44px; border-radius: 4px; border: 1px solid var(--border); background: white; object-fit: contain; }
   .row-actions { display: flex; gap: 0.4rem; }
   .muted { color: var(--muted); font-size: 0.85rem; }
   .error { color: #dc2626; font-size: 0.9rem; margin-top: 0.5rem; }
@@ -68,12 +87,24 @@
 <body>
 
 <h1>Dynamic QR Codes</h1>
-<p class="sub">Generate a QR code once; repoint the destination URL whenever you like.</p>
+<p class="sub">Generate a QR code once; repoint the destination URL whenever you like. Optionally blend in a photo.</p>
 
 <section>
   <h2>Create a QR code</h2>
   <form id="create-form">
     <input type="url" id="dest-url" placeholder="https://example.com/landing-page" required>
+    <label class="field">
+      Photo (optional)
+      <input type="file" id="photo-input" accept="image/*">
+    </label>
+    <label class="field">
+      Accent
+      <input type="color" id="accent-color" value="#1a1a1a">
+    </label>
+    <label class="field">
+      Background
+      <input type="color" id="background-color" value="#ffffff">
+    </label>
     <button type="submit">Generate</button>
   </form>
   <div class="error" id="create-error"></div>
@@ -96,6 +127,7 @@
   <table id="codes-table" style="display:none">
     <thead>
       <tr>
+        <th></th>
         <th>Short link</th>
         <th>Destination</th>
         <th>Scans</th>
@@ -110,6 +142,9 @@
 <script>
 const createForm = document.getElementById('create-form');
 const destInput = document.getElementById('dest-url');
+const photoInput = document.getElementById('photo-input');
+const accentInput = document.getElementById('accent-color');
+const backgroundInput = document.getElementById('background-color');
 const createError = document.getElementById('create-error');
 const result = document.getElementById('result');
 const resultImg = document.getElementById('result-img');
@@ -139,6 +174,13 @@ async function loadCodes() {
 
   for (const c of codes) {
     const tr = document.createElement('tr');
+
+    const thumbTd = document.createElement('td');
+    thumbTd.className = 'thumb';
+    const thumbImg = document.createElement('img');
+    thumbImg.src = c.qr_url;
+    thumbImg.alt = 'QR thumbnail';
+    thumbTd.appendChild(thumbImg);
 
     const linkTd = document.createElement('td');
     const a = document.createElement('a');
@@ -191,6 +233,7 @@ async function loadCodes() {
     actions.appendChild(saveBtn);
     actionsTd.appendChild(actions);
 
+    tr.appendChild(thumbTd);
     tr.appendChild(linkTd);
     tr.appendChild(destTd);
     tr.appendChild(scansTd);
@@ -206,15 +249,22 @@ createForm.addEventListener('submit', async (e) => {
   const url = destInput.value.trim();
   if (!url) return;
 
-  const submitBtn = createForm.querySelector('button');
+  const submitBtn = createForm.querySelector('button[type=submit]');
   submitBtn.disabled = true;
   submitBtn.textContent = 'Generating...';
 
   try {
+    const formData = new FormData();
+    formData.append('url', url);
+    formData.append('accent_color', accentInput.value);
+    formData.append('background_color', backgroundInput.value);
+    if (photoInput.files[0]) {
+      formData.append('photo', photoInput.files[0]);
+    }
+
     const res = await fetch('/codes', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
+      body: formData,
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -231,6 +281,7 @@ createForm.addEventListener('submit', async (e) => {
     result.classList.add('show');
 
     destInput.value = '';
+    photoInput.value = '';
     await loadCodes();
   } catch (e) {
     createError.textContent = e.message;

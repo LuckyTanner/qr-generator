@@ -18,6 +18,9 @@ class QRCode(Base):
     destination_url = Column(String, nullable=False)
     created_at = Column(DateTime, default=utcnow, nullable=False)
     scan_count = Column(Integer, default=0, nullable=False)
+    photo_filename = Column(String, nullable=True)
+    accent_color = Column(String, nullable=True)
+    background_color = Column(String, nullable=True)
 
     scans = relationship(
         "ScanLog", back_populates="qr_code", cascade="all, delete-orphan"
