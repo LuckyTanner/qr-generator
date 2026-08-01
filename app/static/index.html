@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Dynamic QR Codes</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --accent: #4f46e5;
+    --border: #d9dbe3;
+    --muted: #6b7280;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    max-width: 900px;
+    margin: 2rem auto;
+    padding: 0 1.25rem;
+    line-height: 1.4;
+  }
+  h1 { font-size: 1.5rem; margin-bottom: 0.25rem; }
+  p.sub { color: var(--muted); margin-top: 0; }
+  section {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.25rem;
+    margin-bottom: 1.5rem;
+  }
+  h2 { font-size: 1.05rem; margin-top: 0; }
+  form { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  input[type=url], input[type=text] {
+    flex: 1;
+    min-width: 220px;
+    padding: 0.5rem 0.6rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.95rem;
+  }
+  button {
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 0.5rem 0.9rem;
+    font-size: 0.95rem;
+    cursor: pointer;
+  }
+  button:hover { opacity: 0.9; }
+  button.secondary {
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+  }
+  #result { margin-top: 1rem; display: none; gap: 1rem; align-items: flex-start; }
+  #result.show { display: flex; }
+  #result img { width: 150px; height: 150px; border: 1px solid var(--border); border-radius: 6px; }
+  #result .links { flex: 1; }
+  .link-row { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.4rem; }
+  .link-row code { background: rgba(127,127,127,0.15); padding: 0.15rem 0.4rem; border-radius: 4px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 0.5rem 0.4rem; border-bottom: 1px solid var(--border); font-size: 0.9rem; vertical-align: middle; }
+  th { color: var(--muted); font-weight: 600; }
+  .row-actions { display: flex; gap: 0.4rem; }
+  .muted { color: var(--muted); font-size: 0.85rem; }
+  .error { color: #dc2626; font-size: 0.9rem; margin-top: 0.5rem; }
+  #empty { color: var(--muted); font-size: 0.9rem; }
+</style>
+</head>
+<body>
+
+<h1>Dynamic QR Codes</h1>
+<p class="sub">Generate a QR code once; repoint the destination URL whenever you like.</p>
+
+<section>
+  <h2>Create a QR code</h2>
+  <form id="create-form">
+    <input type="url" id="dest-url" placeholder="https://example.com/landing-page" required>
+    <button type="submit">Generate</button>
+  </form>
+  <div class="error" id="create-error"></div>
+  <div id="result">
+    <img id="result-img" alt="QR code">
+    <div class="links">
+      <div class="link-row">
+        <strong>Short link:</strong>
+        <code id="result-short-url"></code>
+        <button class="secondary" id="copy-btn" type="button">Copy</button>
+      </div>
+      <div class="muted">Points to: <span id="result-dest"></span></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Your QR codes</h2>
+  <div id="empty">No codes yet — generate one above.</div>
+  <table id="codes-table" style="display:none">
+    <thead>
+      <tr>
+        <th>Short link</th>
+        <th>Destination</th>
+        <th>Scans</th>
+        <th>Created</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody id="codes-body"></tbody>
+  </table>
+</section>
+
+<script>
+const createForm = document.getElementById('create-form');
+const destInput = document.getElementById('dest-url');
+const createError = document.getElementById('create-error');
+const result = document.getElementById('result');
+const resultImg = document.getElementById('result-img');
+const resultShortUrl = document.getElementById('result-short-url');
+const resultDest = document.getElementById('result-dest');
+const copyBtn = document.getElementById('copy-btn');
+const codesTable = document.getElementById('codes-table');
+const codesBody = document.getElementById('codes-body');
+const emptyMsg = document.getElementById('empty');
+
+function fmtDate(iso) {
+  const d = new Date(iso);
+  return d.toLocaleString();
+}
+
+async function loadCodes() {
+  const res = await fetch('/codes');
+  const codes = await res.json();
+  codesBody.innerHTML = '';
+  if (codes.length === 0) {
+    emptyMsg.style.display = 'block';
+    codesTable.style.display = 'none';
+    return;
+  }
+  emptyMsg.style.display = 'none';
+  codesTable.style.display = 'table';
+
+  for (const c of codes) {
+    const tr = document.createElement('tr');
+
+    const linkTd = document.createElement('td');
+    const a = document.createElement('a');
+    a.href = c.short_url;
+    a.textContent = c.short_url.replace(/^https?:\/\//, '');
+    a.target = '_blank';
+    linkTd.appendChild(a);
+
+    const destTd = document.createElement('td');
+    const destInputEl = document.createElement('input');
+    destInputEl.type = 'text';
+    destInputEl.value = c.destination_url;
+    destInputEl.style.width = '100%';
+    destTd.appendChild(destInputEl);
+
+    const scansTd = document.createElement('td');
+    scansTd.textContent = c.scan_count;
+
+    const createdTd = document.createElement('td');
+    createdTd.className = 'muted';
+    createdTd.textContent = fmtDate(c.created_at);
+
+    const actionsTd = document.createElement('td');
+    const actions = document.createElement('div');
+    actions.className = 'row-actions';
+    const saveBtn = document.createElement('button');
+    saveBtn.textContent = 'Save';
+    saveBtn.className = 'secondary';
+    saveBtn.onclick = async () => {
+      saveBtn.disabled = true;
+      saveBtn.textContent = 'Saving...';
+      try {
+        const res = await fetch(`/codes/${c.short_code}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: destInputEl.value }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || 'Update failed');
+        }
+        saveBtn.textContent = 'Saved';
+        setTimeout(() => { saveBtn.textContent = 'Save'; saveBtn.disabled = false; }, 1200);
+      } catch (e) {
+        saveBtn.textContent = 'Save';
+        saveBtn.disabled = false;
+        alert(e.message);
+      }
+    };
+    actions.appendChild(saveBtn);
+    actionsTd.appendChild(actions);
+
+    tr.appendChild(linkTd);
+    tr.appendChild(destTd);
+    tr.appendChild(scansTd);
+    tr.appendChild(createdTd);
+    tr.appendChild(actionsTd);
+    codesBody.appendChild(tr);
+  }
+}
+
+createForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  createError.textContent = '';
+  const url = destInput.value.trim();
+  if (!url) return;
+
+  const submitBtn = createForm.querySelector('button');
+  submitBtn.disabled = true;
+  submitBtn.textContent = 'Generating...';
+
+  try {
+    const res = await fetch('/codes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || 'Failed to generate QR code');
+    }
+    const shortUrl = res.headers.get('X-Short-Url');
+    const destUrl = res.headers.get('X-Destination-Url');
+    const blob = await res.blob();
+    const objectUrl = URL.createObjectURL(blob);
+
+    resultImg.src = objectUrl;
+    resultShortUrl.textContent = shortUrl;
+    resultDest.textContent = destUrl;
+    result.classList.add('show');
+
+    destInput.value = '';
+    await loadCodes();
+  } catch (e) {
+    createError.textContent = e.message;
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Generate';
+  }
+});
+
+copyBtn.addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(resultShortUrl.textContent);
+    copyBtn.textContent = 'Copied!';
+    setTimeout(() => (copyBtn.textContent = 'Copy'), 1200);
+  } catch (e) {
+    alert('Could not copy: ' + e.message);
+  }
+});
+
+loadCodes();
+</script>
+
+</body>
+</html>
