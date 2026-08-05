@@ -15,27 +15,20 @@ MIN_VERSION = 14  # ~73x73 modules minimum: at low module counts, each module's
 # same forcing reads as fine grain instead of blotches, which is what actually
 # keeps a real (detailed, busy-background) photo recognizable.
 
-# Escalating (low_force, high_force) pairs. low_force controls how much a module
-# that already agrees with the photo gets nudged toward pure black/white;
-# high_force controls how hard a conflicting module gets corrected. We render
-# at the most photo-preserving level first and only fall back to stronger
-# (uglier but safer) levels if the result doesn't actually decode.
-FORCE_LADDER = [
-    (0.05, 0.45),
-    (0.10, 0.60),
-    (0.15, 0.75),
-    (0.15, 0.85),
-    (0.25, 0.90),
-    (0.35, 0.95),
-    (0.50, 1.0),
-    (0.75, 1.0),
-    (1.0, 1.0),  # failsafe: zero photo influence, functionally a plain QR
-]
+# Escalating tint strength: "dark" modules get a uniform semi-transparent tint
+# toward the accent color; "light" modules are left as pure, untouched photo.
+# This asymmetry (rather than pushing both polarities toward their extremes)
+# is what actually gives a halftone-print look instead of salt-and-pepper
+# noise — most of the image stays exactly the source photo, and only the
+# minimum necessary darkening is added. We render at the lightest tint first
+# and only escalate to a stronger (uglier but safer) one if it doesn't
+# actually decode.
+TINT_LADDER = [0.18, 0.22, 0.26, 0.30, 0.35, 0.40, 0.50, 0.65, 0.80, 1.0]
 
 # Some (version, error-correction) encodings of otherwise-ordinary data turn
 # out to be unreliable for certain scanners regardless of styling (observed:
 # version 6 at ERROR_CORRECT_H). Bumping the version sidesteps that, so it's
-# tried as an outer fallback layer alongside the force ladder.
+# tried as an outer fallback layer alongside the tint ladder.
 VERSION_ESCALATION_OFFSETS = [0, 2, 4, 6, 10]
 
 
@@ -47,17 +40,6 @@ def _hex_to_rgb(value: Optional[str], fallback: Tuple[int, int, int]) -> Tuple[i
         return tuple(int(value[i : i + 2], 16) for i in (0, 2, 4))
     except ValueError:
         return fallback
-
-
-def _median_luminance(gray_img: Image.Image) -> float:
-    hist = gray_img.histogram()
-    total = sum(hist)
-    cum = 0
-    for level, count in enumerate(hist):
-        cum += count
-        if cum >= total / 2:
-            return float(level)
-    return 127.0
 
 
 def _alignment_centers(version: int, n: int):
@@ -115,9 +97,9 @@ def _build_qr_matrix(data: str, box_size: int, border: int, min_version: int):
 
 
 def _prepare_photo_render(qr, photo: Image.Image, accent, background, box_size: int, border: int) -> dict:
-    """Do the expensive, force-independent work once per (qr version, photo,
+    """Do the expensive, tint-independent work once per (qr version, photo,
     color) combination: blur/resize the photo down to module resolution and
-    precompute per-module statistics. The force ladder then just re-blends
+    precompute per-module average colors. The tint ladder then just re-blends
     these precomputed arrays, which is cheap enough to try every rung."""
     n = qr.modules_count
     alignment_centers = _alignment_centers(qr.version, n)
@@ -139,33 +121,15 @@ def _prepare_photo_render(qr, photo: Image.Image, accent, background, box_size: 
     fitted = ImageOps.fit(grayscale, (data_size, data_size), Image.LANCZOS)
     duotone = ImageOps.colorize(fitted, black=accent, white=background).convert("RGB")
 
-    fitted_arr = np.asarray(fitted, dtype=np.float64)
     duotone_arr = np.asarray(duotone, dtype=np.float64)
-
-    local_lum_grid = fitted_arr.reshape(n, box_size, n, box_size).mean(axis=(1, 3))
     avg_color_grid = duotone_arr.reshape(n, box_size, n, box_size, 3).mean(axis=(1, 3))
 
     modules_arr = np.array(qr.modules, dtype=bool)
     crisp_mask = _crisp_mask(n, qr.version, alignment_centers)
 
-    threshold = _median_luminance(fitted)
-    light_side_range = max(255.0 - threshold, 1.0)
-    dark_side_range = max(threshold, 1.0)
-
     accent_arr = np.array(accent, dtype=np.float64)
     background_arr = np.array(background, dtype=np.float64)
     target_grid = np.where(modules_arr[..., None], accent_arr, background_arr)
-
-    # How much does each module conflict with what it needs to be? 0 = the
-    # photo already agrees with the required polarity, 1 = fully opposed.
-    # Each direction is normalized by its own actual tonal range around the
-    # threshold, so a narrow-range (e.g. mostly-dark) photo still produces
-    # full-strength conflict signal instead of being swamped by the other side.
-    conflict = np.where(
-        modules_arr,
-        np.clip((local_lum_grid - threshold) / light_side_range, 0.0, 1.0),
-        np.clip((threshold - local_lum_grid) / dark_side_range, 0.0, 1.0),
-    )
 
     return {
         "box_size": box_size,
@@ -174,14 +138,17 @@ def _prepare_photo_render(qr, photo: Image.Image, accent, background, box_size: 
         "offset": offset,
         "avg_color_grid": avg_color_grid,
         "target_grid": target_grid,
-        "conflict": conflict,
+        "modules_arr": modules_arr,
         "crisp_mask": crisp_mask,
         "background": background_arr,
     }
 
 
-def _apply_force(prepared: dict, low_force: float, high_force: float) -> Image.Image:
-    force = low_force + (high_force - low_force) * prepared["conflict"]
+def _apply_tint(prepared: dict, tint: float) -> Image.Image:
+    """Dark modules get pushed toward the accent color by `tint`; light
+    modules are left exactly as the photo shows (tint 0). Crisp zones
+    (finder/timing/alignment/version-info) are always pure, regardless."""
+    force = np.where(prepared["modules_arr"], tint, 0.0)
     color_grid = prepared["avg_color_grid"] + (prepared["target_grid"] - prepared["avg_color_grid"]) * force[..., None]
     color_grid = np.where(prepared["crisp_mask"][..., None], prepared["target_grid"], color_grid)
     color_grid = np.clip(color_grid, 0, 255)
@@ -227,19 +194,18 @@ def build_qr_image(
 
     Without a photo: a plain QR in the given (or default) colors.
 
-    With a photo: the data modules are rendered as a duotone version of the
-    photo. Contrast is added adaptively — a module whose underlying photo
-    pixel already leans the right way (dark module over a naturally dark
-    area, or light module over a naturally light area) is barely touched, so
-    the photo stays recognizable; a module that conflicts with its pixel
-    gets pushed toward the required color so the code still scans. Finder,
-    timing, alignment, and version-info patterns (the structural landmarks
-    and metadata a scanner needs) are left completely crisp.
+    With a photo: "light" modules are rendered as the untouched photo; "dark"
+    modules get a semi-transparent tint toward the accent color. This keeps
+    the vast majority of the image exactly the source photo — only the
+    minimum darkening needed to encode data is added, which reads as fine
+    print-like grain rather than noise. Finder, timing, alignment, and
+    version-info patterns (the structural landmarks and metadata a scanner
+    needs) are left completely crisp.
 
     Every candidate render is verified by actually decoding it before it's
-    returned. If the most photo-preserving version doesn't decode cleanly,
-    we automatically re-render with progressively stronger correction until
-    one does — so a generated code is never handed back broken.
+    returned. If the lightest tint doesn't decode cleanly, we automatically
+    re-render with a progressively stronger (uglier but safer) tint until one
+    does — so a generated code is never handed back broken.
     """
     accent = _hex_to_rgb(accent_color, _hex_to_rgb(DEFAULT_ACCENT, (26, 26, 26)))
     background = _hex_to_rgb(background_color, _hex_to_rgb(DEFAULT_BACKGROUND, (255, 255, 255)))
@@ -256,8 +222,8 @@ def build_qr_image(
             continue
 
         prepared = _prepare_photo_render(qr, photo, accent, background, box_size, border)
-        for low_force, high_force in FORCE_LADDER:
-            candidate = _apply_force(prepared, low_force, high_force)
+        for tint in TINT_LADDER:
+            candidate = _apply_tint(prepared, tint)
             best = candidate
             if _decodes_to(candidate, data):
                 return candidate
