@@ -1,3 +1,4 @@
+import pathlib
 from typing import Optional, Tuple
 
 import cv2
@@ -30,6 +31,49 @@ TINT_LADDER = [0.18, 0.22, 0.26, 0.30, 0.35, 0.40, 0.50, 0.65, 0.80, 1.0]
 # version 6 at ERROR_CORRECT_H). Bumping the version sidesteps that, so it's
 # tried as an outer fallback layer alongside the tint ladder.
 VERSION_ESCALATION_OFFSETS = [0, 2, 4, 6, 10]
+
+_FACE_MODEL_PATH = pathlib.Path(__file__).parent / "models" / "face_detection_yunet.onnx"
+_FACE_DETECTOR = cv2.FaceDetectorYN_create(str(_FACE_MODEL_PATH), "", (320, 320)) if _FACE_MODEL_PATH.exists() else None
+
+
+def _detect_largest_face(photo: Image.Image):
+    """Returns (x, y, w, h) of the largest/most confident detected face, or
+    None. Runs at a downscaled size for speed; the detector's own input size
+    is reset per-call since it depends on image dimensions."""
+    if _FACE_DETECTOR is None:
+        return None
+    img_w, img_h = photo.size
+    bgr = cv2.cvtColor(np.array(photo.convert("RGB")), cv2.COLOR_RGB2BGR)
+    _FACE_DETECTOR.setInputSize((img_w, img_h))
+    _retval, faces = _FACE_DETECTOR.detect(bgr)
+    if faces is None or len(faces) == 0:
+        return None
+    best = max(faces, key=lambda f: f[2] * f[3])
+    x, y, w, h = best[0], best[1], best[2], best[3]
+    return max(0.0, x), max(0.0, y), w, h
+
+
+def _smart_crop_to_square(photo: Image.Image) -> Image.Image:
+    """Crop to a square framed around the largest detected face (with room
+    for head/shoulders), so the QR's limited module budget is spent on the
+    actual subject instead of whatever happens to be centered in the frame —
+    a real photo's subject is rarely dead-center. Falls back to a plain
+    center crop if no face is found."""
+    img_w, img_h = photo.size
+    face = _detect_largest_face(photo)
+
+    if face is not None:
+        x, y, w, h = face
+        cx, cy = x + w / 2.0, y + h / 2.0
+        crop_side = min(max(w, h) * 2.8, img_w, img_h)
+        left = min(max(cx - crop_side / 2, 0), img_w - crop_side)
+        top = min(max(cy - crop_side / 2.3, 0), img_h - crop_side)
+        return photo.crop((left, top, left + crop_side, top + crop_side))
+
+    side = min(img_w, img_h)
+    left = (img_w - side) / 2
+    top = (img_h - side) / 2
+    return photo.crop((left, top, left + side, top + side))
 
 
 def _hex_to_rgb(value: Optional[str], fallback: Tuple[int, int, int]) -> Tuple[int, int, int]:
@@ -209,6 +253,9 @@ def build_qr_image(
     """
     accent = _hex_to_rgb(accent_color, _hex_to_rgb(DEFAULT_ACCENT, (26, 26, 26)))
     background = _hex_to_rgb(background_color, _hex_to_rgb(DEFAULT_BACKGROUND, (255, 255, 255)))
+
+    if photo is not None:
+        photo = _smart_crop_to_square(photo)
 
     best = None
     for offset in VERSION_ESCALATION_OFFSETS:

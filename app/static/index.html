@@ -63,6 +63,18 @@
   }
   button:hover { opacity: 0.9; }
   button:disabled { opacity: 0.6; cursor: default; }
+  .spinner {
+    width: 18px;
+    height: 18px;
+    border: 3px solid rgba(127,127,127,0.25);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    align-self: flex-end;
+    margin-bottom: 0.6rem;
+  }
+  .spinner[hidden] { display: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
   button.secondary {
     background: transparent;
     color: var(--accent);
@@ -106,6 +118,7 @@
       <input type="color" id="background-color" value="#ffffff">
     </label>
     <button type="submit">Generate</button>
+    <span class="spinner" id="generate-spinner" hidden></span>
   </form>
   <div class="error" id="create-error"></div>
   <div id="result">
@@ -151,6 +164,7 @@ const resultImg = document.getElementById('result-img');
 const resultShortUrl = document.getElementById('result-short-url');
 const resultDest = document.getElementById('result-dest');
 const copyBtn = document.getElementById('copy-btn');
+const generateSpinner = document.getElementById('generate-spinner');
 const codesTable = document.getElementById('codes-table');
 const codesBody = document.getElementById('codes-body');
 const emptyMsg = document.getElementById('empty');
@@ -252,6 +266,7 @@ createForm.addEventListener('submit', async (e) => {
   const submitBtn = createForm.querySelector('button[type=submit]');
   submitBtn.disabled = true;
   submitBtn.textContent = 'Generating...';
+  generateSpinner.hidden = false;
 
   try {
     const formData = new FormData();
@@ -286,6 +301,7 @@ createForm.addEventListener('submit', async (e) => {
   } catch (e) {
     createError.textContent = e.message;
   } finally {
+    generateSpinner.hidden = true;
     submitBtn.disabled = false;
     submitBtn.textContent = 'Generate';
   }
